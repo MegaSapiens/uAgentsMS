@@ -1,6 +1,4 @@
-from uagents.setup import fund_agent_if_low
 from uagents import Agent, Context, Model
-
 
 # NOTE: Run agent1.py before running agent2.py
 
@@ -15,8 +13,6 @@ bob = Agent(
     seed="bob secret phrase",
     endpoint=["http://127.0.0.1:8001/submit"],
 )
-
-fund_agent_if_low(bob.wallet.address())
 
 
 @bob.on_message(model=Message)

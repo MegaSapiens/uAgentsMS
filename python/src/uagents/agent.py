@@ -2,15 +2,28 @@
 
 import asyncio
 import functools
-from typing import Dict, List, Optional, Set, Union, Type, Tuple, Any, Coroutine
+import logging
 import uuid
-from pydantic import ValidationError
-import requests
+from typing import Any, Coroutine, Dict, List, Optional, Set, Tuple, Type, Union
 
+import requests
+from cosmpy.aerial.client import LedgerClient
 from cosmpy.aerial.wallet import LocalWallet, PrivateKey
 from cosmpy.crypto.address import Address
-
+from pydantic import ValidationError
 from uagents.asgi import ASGIServer
+from uagents.config import (
+    AVERAGE_BLOCK_INTERVAL,
+    LEDGER_PREFIX,
+    MAINNET_PREFIX,
+    REGISTRATION_FEE,
+    REGISTRATION_RETRY_INTERVAL_SECONDS,
+    REGISTRATION_UPDATE_INTERVAL_SECONDS,
+    TESTNET_PREFIX,
+    get_logger,
+    parse_agentverse_config,
+    parse_endpoint_config,
+)
 from uagents.context import (
     Context,
     EventCallback,
@@ -19,25 +32,18 @@ from uagents.context import (
     MsgDigest,
 )
 from uagents.crypto import Identity, derive_key_from_seed, is_user_address
-from uagents.dispatch import Sink, dispatcher, JsonStr
-from uagents.models import Model, ErrorMessage
-from uagents.protocol import Protocol
-from uagents.resolver import Resolver, GlobalResolver
-from uagents.storage import KeyValueStore, get_or_create_private_keys
-from uagents.network import (
-    get_ledger,
-    get_almanac_contract,
-)
+from uagents.dispatch import JsonStr, Sink, dispatcher
 from uagents.mailbox import MailboxClient
-from uagents.config import (
-    REGISTRATION_FEE,
-    REGISTRATION_UPDATE_INTERVAL_SECONDS,
-    LEDGER_PREFIX,
-    REGISTRATION_RETRY_INTERVAL_SECONDS,
-    parse_endpoint_config,
-    parse_agentverse_config,
-    get_logger,
+from uagents.models import ErrorMessage, Model
+from uagents.network import (
+    InsufficientFundsError,
+    add_testnet_funds,
+    get_almanac_contract,
+    get_ledger,
 )
+from uagents.protocol import Protocol
+from uagents.resolver import GlobalResolver, Resolver
+from uagents.storage import KeyValueStore, get_or_create_private_keys
 
 
 async def _run_interval(func: IntervalCallback, ctx: Context, period: float):
@@ -125,14 +131,15 @@ class Agent(Sink):
         protocols (Dict[str, Protocol]): Dictionary mapping all supported protocol digests to their
         corresponding protocols.
         _ctx (Context): The context for agent interactions.
+        _test (bool): True if the agent will register and transact on the testnet.
 
     Properties:
         name (str): The name of the agent.
         address (str): The address of the agent used for communication.
+        identifier (str): The Agent Identifier, including network prefix and address.
         wallet (LocalWallet): The agent's wallet for transacting on the ledger.
         storage (KeyValueStore): The key-value store for storage operations.
-        mailbox (Dict[str, str]): The mailbox configuration for the agent (deprecated and replaced
-        by agentverse).
+        mailbox (Dict[str, str]): The mailbox configuration for the agent.
         agentverse (Dict[str, str]): The agentverse configuration for the agent.
         mailbox_client (MailboxClient): The client for interacting with the agentverse mailbox.
         protocols (Dict[str, Protocol]): Dictionary mapping all supported protocol digests to their
@@ -149,8 +156,13 @@ class Agent(Sink):
         agentverse: Optional[Union[str, Dict[str, str]]] = None,
         mailbox: Optional[Union[str, Dict[str, str]]] = None,
         resolve: Optional[Resolver] = None,
+        enable_wallet_messaging: Optional[Union[bool, Dict[str, str]]] = False,
+        wallet_key_derivation_index: Optional[int] = 0,
         max_resolver_endpoints: Optional[int] = None,
         version: Optional[str] = None,
+        test: Optional[bool] = True,
+        loop: Optional[asyncio.AbstractEventLoop] = None,
+        log_level: Union[int, str] = logging.INFO,
     ):
         """
         Initialize an Agent instance.
@@ -163,8 +175,15 @@ class Agent(Sink):
             agentverse (Optional[Union[str, Dict[str, str]]]): The agentverse configuration.
             mailbox (Optional[Union[str, Dict[str, str]]]): The mailbox configuration.
             resolve (Optional[Resolver]): The resolver to use for agent communication.
+            enable_wallet_messaging (Optional[Union[bool, Dict[str, str]]]): Whether to enable
+            wallet messaging. If '{"chain_id": CHAIN_ID}' is provided, this sets the chain ID for
+            the messaging server.
+            wallet_key_derivation_index (Optional[int]): The index used for deriving the wallet key.
             max_resolver_endpoints (Optional[int]): The maximum number of endpoints to resolve.
             version (Optional[str]): The version of the agent.
+            test (Optional[bool]): True if the agent will register and transact on the testnet.
+            loop (Optional[asyncio.AbstractEventLoop]): The asyncio event loop to use.
+            log_level (Union[int, str]): The logging level for the agent.
         """
         self._name = name
         self._port = port if port is not None else 8000
@@ -174,11 +193,15 @@ class Agent(Sink):
             if resolve is not None
             else GlobalResolver(max_endpoints=max_resolver_endpoints)
         )
-        self._loop = asyncio.get_event_loop_policy().get_event_loop()
 
-        self._initialize_wallet_and_identity(seed, name)
+        if loop is not None:
+            self._loop = loop
+        else:
+            self._loop = asyncio.get_event_loop_policy().get_event_loop()
 
-        self._logger = get_logger(self.name)
+        # initialize wallet and identity
+        self._initialize_wallet_and_identity(seed, name, wallet_key_derivation_index)
+        self._logger = get_logger(self.name, level=log_level)
 
         # configure endpoints and mailbox
         self._endpoints = parse_endpoint_config(endpoint)
@@ -193,9 +216,6 @@ class Agent(Sink):
                 )
             else:
                 agentverse = mailbox
-            self._logger.warning(
-                "The 'mailbox' configuration is deprecated in favor of 'agentverse'"
-            )
         self._agentverse = parse_agentverse_config(agentverse)
         self._use_mailbox = self._agentverse["use_mailbox"]
         if self._use_mailbox:
@@ -210,8 +230,8 @@ class Agent(Sink):
         else:
             self._mailbox_client = None
 
-        self._ledger = get_ledger()
-        self._almanac_contract = get_almanac_contract()
+        self._ledger = get_ledger(test)
+        self._almanac_contract = get_almanac_contract(test)
         self._storage = KeyValueStore(self.address[0:16])
         self._interval_handlers: List[Tuple[IntervalCallback, float]] = []
         self._interval_messages: Set[str] = set()
@@ -224,7 +244,10 @@ class Agent(Sink):
         self._message_queue = asyncio.Queue()
         self._on_startup = []
         self._on_shutdown = []
+        self._test = test
         self._version = version or "0.1.0"
+
+        self.initialize_wallet_messaging(enable_wallet_messaging)
 
         # initialize the internal agent protocol
         self._protocol = Protocol(name=self._name, version=self._version)
@@ -234,6 +257,7 @@ class Agent(Sink):
 
         self._ctx = Context(
             self._identity.address,
+            self.identifier,
             self._name,
             self._storage,
             self._resolver,
@@ -243,6 +267,7 @@ class Agent(Sink):
             self._queries,
             replies=self._replies,
             interval_messages=self._interval_messages,
+            wallet_messaging_client=self._wallet_messaging_client,
             protocols=self.protocols,
             logger=self._logger,
         )
@@ -260,7 +285,7 @@ class Agent(Sink):
         async def _handle_error_message(ctx: Context, sender: str, msg: ErrorMessage):
             ctx.logger.exception(f"Received error message from {sender}: {msg.error}")
 
-    def _initialize_wallet_and_identity(self, seed, name):
+    def _initialize_wallet_and_identity(self, seed, name, wallet_key_derivation_index):
         """
         Initialize the wallet and identity for the agent.
 
@@ -270,6 +295,7 @@ class Agent(Sink):
         Args:
             seed (str or None): The seed for generating keys.
             name (str or None): The name of the agent.
+            wallet_key_derivation_index (int): The index for deriving the wallet key.
         """
         if seed is None:
             if name is None:
@@ -282,11 +308,50 @@ class Agent(Sink):
         else:
             self._identity = Identity.from_seed(seed, 0)
             self._wallet = LocalWallet(
-                PrivateKey(derive_key_from_seed(seed, LEDGER_PREFIX, 0)),
+                PrivateKey(
+                    derive_key_from_seed(
+                        seed, LEDGER_PREFIX, wallet_key_derivation_index
+                    )
+                ),
                 prefix=LEDGER_PREFIX,
             )
         if name is None:
             self._name = self.address[0:16]
+
+    def initialize_wallet_messaging(
+        self, enable_wallet_messaging: Union[bool, Dict[str, str]]
+    ):
+        """
+        Initialize wallet messaging for the agent.
+
+        Args:
+            enable_wallet_messaging (Union[bool, Dict[str, str]]): Wallet messaging configuration.
+        """
+        if enable_wallet_messaging:
+            wallet_chain_id = self._ledger.network_config.chain_id
+            if (
+                isinstance(enable_wallet_messaging, dict)
+                and "chain_id" in enable_wallet_messaging
+            ):
+                wallet_chain_id = enable_wallet_messaging["chain_id"]
+
+            try:
+                from uagents.wallet_messaging import WalletMessagingClient
+
+                self._wallet_messaging_client = WalletMessagingClient(
+                    self._identity,
+                    self._wallet,
+                    wallet_chain_id,
+                    self._logger,
+                )
+            except ModuleNotFoundError:
+                self._logger.exception(
+                    "Unable to include wallet messaging. "
+                    "Please install the 'wallet' extra to enable wallet messaging."
+                )
+                self._wallet_messaging_client = None
+        else:
+            self._wallet_messaging_client = None
 
     @property
     def name(self) -> str:
@@ -309,6 +374,17 @@ class Agent(Sink):
         return self._identity.address
 
     @property
+    def identifier(self) -> str:
+        """
+        Get the Agent Identifier, including network prefix and address.
+
+        Returns:
+            str: The agent's identifier.
+        """
+        prefix = TESTNET_PREFIX if self._test else MAINNET_PREFIX
+        return prefix + "://" + self._identity.address
+
+    @property
     def wallet(self) -> LocalWallet:
         """
         Get the wallet of the agent.
@@ -317,6 +393,16 @@ class Agent(Sink):
             LocalWallet: The agent's wallet.
         """
         return self._wallet
+
+    @property
+    def ledger(self) -> LedgerClient:
+        """
+        Get the ledger of the agent.
+
+        Returns:
+            LedgerClient: The agent's ledger
+        """
+        return self._ledger
 
     @property
     def storage(self) -> KeyValueStore:
@@ -331,7 +417,8 @@ class Agent(Sink):
     @property
     def mailbox(self) -> Dict[str, str]:
         """
-        Get the mailbox configuration of the agent (deprecated and replaced by agentverse).
+        Get the mailbox configuration of the agent.
+        Agentverse overrides it but mailbox is kept for backwards compatibility.
 
         Returns:
             Dict[str, str]: The mailbox configuration.
@@ -358,10 +445,22 @@ class Agent(Sink):
         """
         return self._mailbox_client
 
+    @property
+    def balance(self) -> int:
+        """
+        Get the balance of the agent.
+
+        Returns:
+            int: Bank balance.
+        """
+
+        return self.ledger.query_bank_balance(Address(self.wallet.address()))
+
     @mailbox.setter
     def mailbox(self, config: Union[str, Dict[str, str]]):
         """
-        Set the mailbox configuration for the agent (deprecated and replaced by agentverse).
+        Set the mailbox configuration for the agent.
+        Agentverse overrides it but mailbox is kept for backwards compatibility.
 
         Args:
             config (Union[str, Dict[str, str]]): The new mailbox configuration.
@@ -472,20 +571,24 @@ class Agent(Sink):
             or list(self.protocols.keys())
             != self._almanac_contract.get_protocols(self.address)
         ):
-            agent_balance = self._ledger.query_bank_balance(
-                Address(self.wallet.address())
-            )
-
-            if agent_balance < REGISTRATION_FEE:
+            if self.balance < REGISTRATION_FEE:
                 self._logger.warning(
-                    f"I do not have enough funds to register on Almanac contract\
-                        \nFund using wallet address: {self.wallet.address()}"
+                    "I do not have enough funds to register on Almanac contract"
                 )
-                return
+                if self._test:
+                    add_testnet_funds(str(self.wallet.address()))
+                    self._logger.info(
+                        f"Adding testnet funds to {self.wallet.address()}"
+                    )
+                else:
+                    self._logger.info(
+                        f"Send funds to wallet address: {self.wallet.address()}"
+                    )
+                raise InsufficientFundsError()
             self._logger.info("Registering on almanac contract...")
             signature = self.sign_registration()
             await self._almanac_contract.register(
-                self._ledger,
+                self.ledger,
                 self.wallet,
                 self.address,
                 list(self.protocols.keys()),
@@ -507,6 +610,8 @@ class Agent(Sink):
         time_until_next_registration = REGISTRATION_UPDATE_INTERVAL_SECONDS
         try:
             await self.register()
+        except InsufficientFundsError:
+            time_until_next_registration = 2 * AVERAGE_BLOCK_INTERVAL
         except Exception as ex:
             self._logger.exception(f"Failed to register on almanac contract: {ex}")
             time_until_next_registration = REGISTRATION_RETRY_INTERVAL_SECONDS
@@ -627,6 +732,16 @@ class Agent(Sink):
         elif event_type == "shutdown":
             self._on_shutdown.append(func)
 
+    def on_wallet_message(
+        self,
+    ):
+        if self._wallet_messaging_client is None:
+            self._logger.warning(
+                "Discarding 'on_wallet_message' handler because wallet messaging is disabled"
+            )
+            return lambda func: func
+        return self._wallet_messaging_client.on_message()
+
     def include(self, protocol: Protocol, publish_manifest: Optional[bool] = False):
         """
         Include a protocol into the agent's capabilities.
@@ -651,13 +766,13 @@ class Agent(Sink):
             if schema_digest in self._signed_message_handlers:
                 raise RuntimeError("Unable to register duplicate message handler")
             if schema_digest in protocol.signed_message_handlers:
-                self._signed_message_handlers[
-                    schema_digest
-                ] = protocol.signed_message_handlers[schema_digest]
+                self._signed_message_handlers[schema_digest] = (
+                    protocol.signed_message_handlers[schema_digest]
+                )
             elif schema_digest in protocol.unsigned_message_handlers:
-                self._unsigned_message_handlers[
-                    schema_digest
-                ] = protocol.unsigned_message_handlers[schema_digest]
+                self._unsigned_message_handlers[schema_digest] = (
+                    protocol.unsigned_message_handlers[schema_digest]
+                )
             else:
                 raise RuntimeError("Unable to lookup up message handler in protocol")
 
@@ -668,6 +783,8 @@ class Agent(Sink):
 
         if protocol.digest is not None:
             self.protocols[protocol.digest] = protocol
+            if self._ctx is not None:
+                self._ctx.update_protocols(protocol)
 
         if publish_manifest:
             self.publish_manifest(protocol.manifest())
@@ -750,10 +867,6 @@ class Agent(Sink):
         # register the internal agent protocol
         self.include(self._protocol)
         self._loop.run_until_complete(self._startup())
-        if self._endpoints is None:
-            self._logger.warning(
-                "I have no endpoint and won't be able to receive external messages"
-            )
         self.start_background_tasks()
 
     def start_background_tasks(self):
@@ -771,6 +884,16 @@ class Agent(Sink):
         task = self._loop.create_task(self._process_message_queue())
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
+
+        # start the wallet messaging client if enabled
+        if self._wallet_messaging_client is not None:
+            for task in [
+                self._wallet_messaging_client.poll_server(),
+                self._wallet_messaging_client.process_message_queue(self._ctx),
+            ]:
+                new_task = self._loop.create_task(task)
+                self._background_tasks.add(new_task)
+                new_task.add_done_callback(self._background_tasks.discard)
 
     def run(self):
         """
@@ -806,6 +929,7 @@ class Agent(Sink):
 
             context = Context(
                 self._identity.address,
+                self.identifier,
                 self._name,
                 self._storage,
                 self._resolver,
@@ -843,7 +967,54 @@ class Agent(Sink):
             )
             if handler is None:
                 if not is_user_address(sender):
-                    handler = self._signed_message_handlers.get(schema_digest)
+                    is_valid = True  # always valid unless considered invalid as part of a dialogue
+                    for protocol in context.protocols.values():
+                        if hasattr(protocol, "rules") and protocol.is_included(
+                            schema_digest
+                        ):
+                            state = protocol.get_current_state(session)
+                            context.logger.debug(
+                                "current state: "
+                                f"{(protocol.models[state].__name__ if state else 'n/a')}"
+                            )
+                            is_valid = protocol.is_valid_message(session, schema_digest)
+                            context.logger.debug(
+                                f"message {self._models[schema_digest].__name__} "
+                                f"allowed: {is_valid}"
+                            )
+
+                            if not is_valid:
+                                context.reset_session()
+                                await _send_error_message(
+                                    context,
+                                    sender,
+                                    ErrorMessage(
+                                        error=f"Unexpected message in dialogue: {message}"
+                                    ),
+                                )
+                                break
+
+                            if protocol.is_starter(schema_digest):
+                                self._ctx.logger.debug("dialogue started")
+                            elif protocol.is_ender(schema_digest):
+                                self._ctx.logger.debug(
+                                    "dialogue ended, cleaning up session"
+                                )
+                            else:
+                                self._ctx.logger.debug("dialogue picked up")
+
+                            context.dialogue = protocol.get_session(
+                                session
+                            )  # add current dialogue messages to context
+                            protocol.add_message(
+                                session_id=session,
+                                message_type=self._models[schema_digest].__name__,
+                                sender=sender,
+                                receiver=self.address,
+                                content=message,
+                            )
+                    if is_valid:
+                        handler = self._signed_message_handlers.get(schema_digest)
                 elif schema_digest in self._signed_message_handlers:
                     await _send_error_message(
                         context,
@@ -894,6 +1065,7 @@ class Bureau:
         self,
         port: Optional[int] = None,
         endpoint: Optional[Union[str, List[str], Dict[str, dict]]] = None,
+        log_level: Union[int, str] = logging.INFO,
     ):
         """
         Initialize a Bureau instance.
@@ -908,7 +1080,7 @@ class Bureau:
         self._endpoints = parse_endpoint_config(endpoint)
         self._port = port or 8000
         self._queries: Dict[str, asyncio.Future] = {}
-        self._logger = get_logger("bureau")
+        self._logger = get_logger("bureau", log_level)
         self._server = ASGIServer(self._port, self._loop, self._queries, self._logger)
         self._use_mailbox = False
 
