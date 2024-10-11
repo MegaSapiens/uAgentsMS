@@ -3,6 +3,7 @@
 import json
 
 from dialogues.chitchat import ChitChatDialogue
+
 from uagents import Agent, Context, Model
 
 CHAT_AGENT_ADDRESS = "agent1qgp7urkvx24a2gs8e7496fajzy78h4887vz7va4h7klzf7azzhthsz7zymu"
@@ -40,7 +41,7 @@ class RejectChitChatDialogue(Model):
 # instantiate the dialogues
 chitchat_dialogue = ChitChatDialogue(
     version="0.1",
-    agent_address=agent.address,
+    storage=agent.storage,
 )
 
 # get an overview of the dialogue structure
@@ -80,7 +81,7 @@ async def reject_chitchat(
     _msg: RejectChitChatDialogue,
 ):
     # do something when the dialogue is rejected and nothing has been sent yet
-    ctx.logger.info(f"Received conclude message from: {sender}")
+    ctx.logger.info(f"Received reject message from: {sender}")
 
 
 @chitchat_dialogue.on_continue_dialogue(ChitChatDialogueMessage)
@@ -105,8 +106,15 @@ async def conclude_chitchat(
     _msg: ConcludeChitChatDialogue,
 ):
     # do something when the dialogue is concluded after messages have been exchanged
-    ctx.logger.info(f"Received conclude message from: {sender}; accessing history:")
-    ctx.logger.info(ctx.dialogue)
+    ctx.logger.info(
+        f"Received conclude message from: {sender};\n"
+        "accessing history showing only ChitChat messages:"
+    )
+    ctx.logger.info(
+        chitchat_dialogue.get_conversation(
+            ctx.session, ChitChatDialogueMessage.__name__
+        )
+    )
 
 
 agent.include(chitchat_dialogue)

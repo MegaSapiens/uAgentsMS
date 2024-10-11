@@ -25,18 +25,18 @@ Property to access the base url of the mailbox server.
 
 Returns: The base url of the mailbox server.
 
-<a id="src.uagents.mailbox.MailboxClient.api_key"></a>
+<a id="src.uagents.mailbox.MailboxClient.agent_mailbox_key"></a>
 
-#### api`_`key
+#### agent`_`mailbox`_`key
 
 ```python
 @property
-def api_key()
+def agent_mailbox_key()
 ```
 
-Property to access the api key of the mailbox server.
+Property to access the agent_mailbox_key of the mailbox server.
 
-Returns: The api key of the mailbox server.
+Returns: The agent_mailbox_key of the mailbox server.
 
 <a id="src.uagents.mailbox.MailboxClient.protocol"></a>
 
@@ -49,7 +49,7 @@ def protocol()
 
 Property to access the protocol of the mailbox server.
 
-Returns: The protocol of the mailbox server {http, https}.
+Returns: The protocol of the mailbox server {ws, wss, http, https}.
 
 <a id="src.uagents.mailbox.MailboxClient.http_prefix"></a>
 
@@ -70,6 +70,16 @@ Returns: The http prefix of the mailbox server {http, https}.
 
 ```python
 async def run()
+```
+
+Runs the mailbox client.
+
+<a id="src.uagents.mailbox.MailboxClient.start_polling"></a>
+
+#### start`_`polling
+
+```python
+async def start_polling()
 ```
 
 Runs the mailbox client. Acquires an access token if needed and then starts a polling loop.

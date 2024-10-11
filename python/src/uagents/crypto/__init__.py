@@ -8,6 +8,7 @@ from typing import Tuple, Union
 import bech32
 import ecdsa
 from ecdsa.util import sigencode_string_canonize
+
 from uagents.config import USER_PREFIX
 
 SHA_LENGTH = 256
@@ -113,6 +114,7 @@ class Identity:
 
         return Identity(signing_key)
 
+    # this is not the real private key but a signing key derived from the private key
     @property
     def private_key(self) -> str:
         """Property to access the private key of the identity."""
@@ -194,9 +196,4 @@ class Identity:
         # build the verifying key
         verifying_key = ecdsa.VerifyingKey.from_string(pk_data, curve=ecdsa.SECP256k1)
 
-        try:
-            result = verifying_key.verify_digest(sig_data, digest)
-        except ecdsa.keys.BadSignatureError:
-            return False
-
-        return result
+        return verifying_key.verify_digest(sig_data, digest)

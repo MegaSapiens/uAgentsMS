@@ -3,11 +3,18 @@
 import base64
 import hashlib
 import struct
-from typing import Any, Optional
+import time
+from typing import Callable, List, Optional
 
-from pydantic import UUID4, BaseModel, Field
+from pydantic import (
+    UUID4,
+    BaseModel,
+    Field,
+    field_serializer,
+)
+
 from uagents.crypto import Identity
-from uagents.dispatch import JsonStr
+from uagents.types import JsonStr
 
 
 class Envelope(BaseModel):
@@ -20,7 +27,7 @@ class Envelope(BaseModel):
         target (str): The target's address.
         session (UUID4): The session UUID that persists for back-and-forth
         dialogues between agents.
-        schema_digest (str): The schema digest for the enclosed message (alias for protocol).
+        schema_digest (str): The schema digest for the enclosed message.
         protocol_digest (Optional[str]): The digest of the protocol associated with the message
         (optional).
         payload (Optional[str]): The encoded message payload of the envelope (optional).
@@ -33,15 +40,12 @@ class Envelope(BaseModel):
     sender: str
     target: str
     session: UUID4
-    schema_digest: str = Field(alias="protocol")
+    schema_digest: str
     protocol_digest: Optional[str] = None
     payload: Optional[str] = None
     expires: Optional[int] = None
     nonce: Optional[int] = None
     signature: Optional[str] = None
-
-    class Config:
-        allow_population_by_field_name = True
 
     def encode_payload(self, value: JsonStr):
         """
@@ -52,37 +56,43 @@ class Envelope(BaseModel):
         """
         self.payload = base64.b64encode(value.encode()).decode()
 
-    def decode_payload(self) -> Optional[Any]:
+    def decode_payload(self) -> str:
         """
         Decode and retrieve the payload value from the envelope.
 
         Returns:
-            Optional[Any]: The decoded payload value, or None if payload is not present.
+            str: The decoded payload value, or '' if payload is not present.
         """
         if self.payload is None:
-            return None
+            return ""
 
         return base64.b64decode(self.payload).decode()
 
-    def sign(self, identity: Identity):
+    def sign(self, signing_fn: Callable):
         """
-        Sign the envelope using the provided identity.
+        Sign the envelope using the provided signing function.
 
         Args:
-            identity (Identity): The identity used for signing.
+            signing_fn (callback): The callback used for signing.
         """
-        self.signature = identity.sign_digest(self._digest())
+        try:
+            self.signature = signing_fn(self._digest())
+        except Exception as err:
+            raise ValueError(f"Failed to sign envelope: {err}") from err
 
     def verify(self) -> bool:
         """
         Verify the envelope's signature.
 
         Returns:
-            bool: True if the signature is valid, False otherwise.
+            bool: True if the signature is valid.
+
+        Raises:
+            ValueError: If the signature is missing.
+            ecdsa.BadSignatureError: If the signature is invalid.
         """
         if self.signature is None:
-            return False
-
+            raise ValueError("Envelope signature is missing")
         return Identity.verify_digest(self.sender, self._digest(), self.signature)
 
     def _digest(self) -> bytes:
@@ -104,3 +114,47 @@ class Envelope(BaseModel):
         if self.nonce is not None:
             hasher.update(struct.pack(">Q", self.nonce))
         return hasher.digest()
+
+
+class EnvelopeHistoryEntry(BaseModel):
+    timestamp: int = Field(default_factory=lambda: int(time.time()))
+    version: int
+    sender: str
+    target: str
+    session: UUID4
+    schema_digest: str
+    protocol_digest: Optional[str] = None
+    payload: Optional[str] = None
+
+    @field_serializer("session")
+    def serialize_session(self, session: UUID4, _info):
+        return str(session)
+
+    @classmethod
+    def from_envelope(cls, envelope: Envelope):
+        return cls(
+            version=envelope.version,
+            sender=envelope.sender,
+            target=envelope.target,
+            session=envelope.session,
+            schema_digest=envelope.schema_digest,
+            protocol_digest=envelope.protocol_digest,
+            payload=envelope.decode_payload(),
+        )
+
+
+class EnvelopeHistory(BaseModel):
+    envelopes: List[EnvelopeHistoryEntry]
+
+    def add_entry(self, entry: EnvelopeHistoryEntry):
+        self.envelopes.append(entry)
+        self.apply_retention_policy()
+
+    def apply_retention_policy(self):
+        """Remove entries older than 24 hours"""
+        cutoff_time = time.time() - 86400
+        for e in self.envelopes:
+            if e.timestamp < cutoff_time:
+                self.envelopes.remove(e)
+            else:
+                break
